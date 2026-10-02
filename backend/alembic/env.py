@@ -1,6 +1,6 @@
 from logging.config import fileConfig
 
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import engine_from_config, pool, text
 from alembic import context
 
 from app.core.config import settings
@@ -20,11 +20,13 @@ target_metadata = Base.metadata
 
 def run_migrations_offline():
     url = settings.DATABASE_URL
+
     context.configure(
         url=url,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
+        include_schemas=True,
     )
 
     with context.begin_transaction():
@@ -39,9 +41,15 @@ def run_migrations_online():
     )
 
     with connectable.connect() as connection:
+        # Ensure PostgreSQL uses the public schema
+        connection.execute(
+            text("SET search_path TO public")
+        )
+
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
+            include_schemas=True,
         )
 
         with context.begin_transaction():

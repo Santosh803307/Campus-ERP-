@@ -36,3 +36,8 @@ uploads/
 
 # Logs
 *.log
+
+# Local database backup
+backend/*.dump
+# Local database backups
+*.dump
