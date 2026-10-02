@@ -107,9 +107,9 @@ export async function deleteExam(
 
 export async function getMyExams(): Promise<Exam[]> {
   const response =
-    await api.get<Exam[]>(
+    await api.get<ExamListResponse>(
       "/api/exams/me"
     );
 
-  return response.data;
+  return response.data.data;
 }

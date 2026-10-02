@@ -20,7 +20,7 @@ export default function StudentResultsPage() {
 
                 const response = await getMyExamResults();
 
-                setResults(response);
+                setResults(response.data);
             } catch (err) {
                 console.error("Failed to load exam results:", err);
 
@@ -280,8 +280,8 @@ export default function StudentResultsPage() {
 
                                                             <span
                                                                 className={`rounded-full px-4 py-2 text-sm font-bold ${isPass
-                                                                        ? "border border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
-                                                                        : "border border-red-500/30 bg-red-500/10 text-red-400"
+                                                                    ? "border border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
+                                                                    : "border border-red-500/30 bg-red-500/10 text-red-400"
                                                                     }`}
                                                             >
                                                                 {result.result_status}

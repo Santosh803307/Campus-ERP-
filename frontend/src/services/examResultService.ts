@@ -104,11 +104,16 @@ export async function deleteExamResult(
    STUDENT
 ========================= */
 
+export interface StudentExamResultListResponse {
+  data: StudentExamResult[];
+  total: number;
+}
+
 export async function getMyExamResults(): Promise<
-  StudentExamResult[]
+  StudentExamResultListResponse
 > {
   const response =
-    await api.get<StudentExamResult[]>(
+    await api.get<StudentExamResultListResponse>(
       "/api/exam-results/me"
     );
 
