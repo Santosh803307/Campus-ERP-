@@ -41,7 +41,6 @@ def run_migrations_online():
     )
 
     with connectable.connect() as connection:
-        # Ensure PostgreSQL uses the public schema
         connection.execute(
             text("SET search_path TO public")
         )
@@ -49,7 +48,7 @@ def run_migrations_online():
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
-            include_schemas=True,
+            include_schemas=False,
         )
 
         with context.begin_transaction():
