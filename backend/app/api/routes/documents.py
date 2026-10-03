@@ -1,5 +1,10 @@
+from io import BytesIO
 from pathlib import Path
 from uuid import uuid4
+
+import cloudinary.exceptions
+from cloudinary import uploader
+import httpx
 
 from fastapi import (
     APIRouter,
@@ -10,11 +15,12 @@ from fastapi import (
     UploadFile,
     status,
 )
-from fastapi.responses import FileResponse
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core import cloudinary as cloudinary_config
 from app.core.database import get_db
 from app.core.security import require_roles
 from app.models.document import StudentDocument
@@ -25,6 +31,7 @@ from app.schemas.document import (
     StudentDocumentResponse,
 )
 
+
 router = APIRouter(
     prefix="/api/documents",
     tags=["Student Documents"],
@@ -32,23 +39,75 @@ router = APIRouter(
 
 
 # =========================================================
-# FILE STORAGE
+# CONFIGURATION
 # =========================================================
 
-BASE_DIR = Path(__file__).resolve().parents[3]
-
-UPLOAD_DIR = (
-    BASE_DIR
-    / "uploads"
-    / "documents"
-)
-
-UPLOAD_DIR.mkdir(
-    parents=True,
-    exist_ok=True,
-)
-
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
+
+CLOUDINARY_FOLDER = "campus_erp/documents"
+
+
+# =========================================================
+# HELPER — FETCH PDF FROM CLOUDINARY
+# =========================================================
+
+async def fetch_cloudinary_pdf(
+    document: StudentDocument,
+) -> StreamingResponse:
+    """
+    Fetch a PDF from Cloudinary on the backend and return it
+    to the authenticated frontend.
+
+    The Cloudinary URL is never directly exposed to the
+    browser through a redirect.
+    """
+
+    if not document.file_url:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document file URL not found",
+        )
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=30.0,
+            follow_redirects=True,
+        ) as client:
+            response = await client.get(
+                document.file_url
+            )
+
+    except httpx.HTTPError as error:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=(
+                "Unable to retrieve document "
+                f"from Cloudinary: {error}"
+            ),
+        )
+
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Cloudinary document could not be retrieved",
+        )
+
+    content_type = response.headers.get(
+        "content-type",
+        "application/pdf",
+    )
+
+    return StreamingResponse(
+        BytesIO(response.content),
+        media_type=content_type,
+        headers={
+            "Content-Disposition": (
+                f'inline; filename="{document.file_name}"'
+            ),
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 # =========================================================
@@ -94,7 +153,7 @@ def get_my_documents(
 
 
 # =========================================================
-# ADMIN — ALL DOCUMENTS
+# ADMIN / FACULTY / HOD — ALL DOCUMENTS
 # =========================================================
 
 @router.get(
@@ -138,10 +197,15 @@ def get_all_documents(
         "total": len(documents),
     }
 
+
+# =========================================================
+# ADMIN — VIEW DOCUMENT
+# =========================================================
+
 @router.get(
     "/admin/{document_id}/file",
 )
-def download_admin_document(
+async def download_admin_document(
     document_id: int,
     current_user: User = Depends(
         require_roles("admin")
@@ -159,28 +223,34 @@ def download_admin_document(
             detail="Document not found",
         )
 
-    stored_filename = (
-        Path(document.file_url).name
-        if document.file_url
-        else ""
-    )
-
-    file_path = (
-        UPLOAD_DIR
-        / stored_filename
-    )
-
-    if not file_path.exists():
+    if not document.file_url:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Document file not found",
+            detail="Document file URL not found",
         )
 
-    return FileResponse(
-        path=file_path,
-        media_type="application/pdf",
-        filename=document.file_name,
+    # -----------------------------------------------------
+    # Cloudinary document
+    # -----------------------------------------------------
+
+    if document.cloudinary_public_id:
+        return await fetch_cloudinary_pdf(
+            document
+        )
+
+    # -----------------------------------------------------
+    # Old local-storage document
+    # -----------------------------------------------------
+
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="Document file is no longer available",
     )
+
+
+# =========================================================
+# ADMIN — DELETE DOCUMENT
+# =========================================================
 
 @router.delete(
     "/{document_id}",
@@ -204,27 +274,38 @@ def delete_document(
             detail="Document not found",
         )
 
-    stored_filename = (
-        Path(document.file_url).name
-        if document.file_url
-        else ""
-    )
+    # -----------------------------------------------------
+    # Delete from Cloudinary
+    # -----------------------------------------------------
 
-    file_path = (
-        UPLOAD_DIR
-        / stored_filename
-    )
+    if document.cloudinary_public_id:
+        try:
+            uploader.destroy(
+                document.cloudinary_public_id,
+                resource_type="raw",
+                type="upload",
+                invalidate=True,
+            )
+
+        except cloudinary.exceptions.Error as error:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=(
+                    "Unable to delete document from "
+                    f"Cloudinary: {error}"
+                ),
+            )
+
+    # -----------------------------------------------------
+    # Delete database record
+    # -----------------------------------------------------
 
     db.delete(document)
     db.commit()
 
-    try:
-        if file_path.exists():
-            file_path.unlink()
-    except OSError:
-        pass
-
     return None
+
+
 # =========================================================
 # ADMIN — CREATE DOCUMENT RECORD
 # =========================================================
@@ -378,7 +459,7 @@ async def upload_document(
         )
 
     # -----------------------------------------------------
-    # Basic PDF signature validation
+    # Validate PDF signature
     # -----------------------------------------------------
 
     if not contents.startswith(b"%PDF"):
@@ -388,29 +469,54 @@ async def upload_document(
         )
 
     # -----------------------------------------------------
-    # Generate safe unique filename
+    # Generate Cloudinary Public ID
     # -----------------------------------------------------
 
-    stored_filename = (
+    public_id = (
+        f"{CLOUDINARY_FOLDER}/"
         f"{uuid4().hex}.pdf"
     )
 
-    file_path = (
-        UPLOAD_DIR
-        / stored_filename
-    )
-
     # -----------------------------------------------------
-    # Save file
+    # Upload to Cloudinary
     # -----------------------------------------------------
 
     try:
-        file_path.write_bytes(contents)
+        upload_result = uploader.upload(
+            BytesIO(contents),
+            resource_type="raw",
+            public_id=public_id,
+            overwrite=False,
+        )
 
-    except OSError:
+    except cloudinary.exceptions.Error as error:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Unable to save uploaded file",
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=(
+                "Unable to upload document to "
+                f"Cloudinary: {error}"
+            ),
+        )
+
+    # -----------------------------------------------------
+    # Get Cloudinary response
+    # -----------------------------------------------------
+
+    cloudinary_url = upload_result.get(
+        "secure_url"
+    )
+
+    uploaded_public_id = upload_result.get(
+        "public_id"
+    )
+
+    if (
+        not cloudinary_url
+        or not uploaded_public_id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Cloudinary upload failed",
         )
 
     # -----------------------------------------------------
@@ -421,7 +527,8 @@ async def upload_document(
         student_id=student_id,
         document_type=clean_type,
         title=clean_title,
-        file_url=stored_filename,
+        file_url=cloudinary_url,
+        cloudinary_public_id=uploaded_public_id,
         file_name=original_filename,
         status="available",
     )
@@ -435,12 +542,19 @@ async def upload_document(
     except IntegrityError:
         db.rollback()
 
-        # Remove uploaded file if DB operation fails
+        # -------------------------------------------------
+        # Roll back Cloudinary upload if DB fails
+        # -------------------------------------------------
+
         try:
-            file_path.unlink(
-                missing_ok=True
+            uploader.destroy(
+                uploaded_public_id,
+                resource_type="raw",
+                type="upload",
+                invalidate=True,
             )
-        except OSError:
+
+        except cloudinary.exceptions.Error:
             pass
 
         raise HTTPException(
@@ -449,6 +563,11 @@ async def upload_document(
         )
 
     return document
+
+
+# =========================================================
+# STUDENT — DOCUMENT DETAILS
+# =========================================================
 
 @router.get(
     "/{document_id}",
@@ -496,7 +615,7 @@ def get_my_document(
 @router.get(
     "/{document_id}/file",
 )
-def download_my_document(
+async def download_my_document(
     document_id: int,
     current_user: User = Depends(
         require_roles("student")
@@ -528,25 +647,26 @@ def download_my_document(
             detail="Document not found",
         )
 
-    stored_filename = (
-        Path(document.file_url).name
-        if document.file_url
-        else ""
-    )
-
-    file_path = (
-        UPLOAD_DIR
-        / stored_filename
-    )
-
-    if not file_path.exists():
+    if not document.file_url:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Document file not found",
+            detail="Document file URL not found",
         )
 
-    return FileResponse(
-        path=file_path,
-        media_type="application/pdf",
-        filename=document.file_name,
+    # -----------------------------------------------------
+    # Cloudinary document
+    # -----------------------------------------------------
+
+    if document.cloudinary_public_id:
+        return await fetch_cloudinary_pdf(
+            document
+        )
+
+    # -----------------------------------------------------
+    # Old local-storage document
+    # -----------------------------------------------------
+
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="Document file is no longer available",
     )

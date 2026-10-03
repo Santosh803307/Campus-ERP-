@@ -40,6 +40,12 @@ class StudentDocument(Base):
         nullable=False,
     )
 
+    cloudinary_public_id: Mapped[str | None] = mapped_column(
+        String(500),
+        nullable=True,
+        index=True,
+    )
+
     file_name: Mapped[str] = mapped_column(
         String(255),
         nullable=False,
